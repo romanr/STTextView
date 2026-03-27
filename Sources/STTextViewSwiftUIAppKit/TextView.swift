@@ -495,10 +495,14 @@ private struct TextViewRepresentable: NSViewRepresentable {
             context.coordinator.isUpdating = true
             textView.attributedText = NSAttributedString(styledAttributedString(textView.typingAttributes))
             context.coordinator.isUpdating = false
+            // External text change invalidates any pending deferred selection from old content
+            context.coordinator.selectionGeneration += 1
+            context.coordinator.hasPendingSelectionUpdate = false
         }
         context.coordinator.isUserEditing = false
 
-        if textView.textSelection != selection, let selection {
+        if !context.coordinator.hasPendingSelectionUpdate,
+           textView.textSelection != selection, let selection {
             textView.textSelection = selection
         }
 
@@ -627,6 +631,10 @@ private struct TextViewRepresentable: NSViewRepresentable {
         @Binding var selection: NSRange?
         var isUpdating = false
         var isUserEditing = false
+        var hasPendingSelectionUpdate = false
+        /// Incremented on each deferred selection dispatch and when text changes externally.
+        /// Stale deferred blocks compare their captured generation to skip applying outdated selections.
+        var selectionGeneration: UInt64 = 0
         var lastFont: NSFont?
         /// Keeps the gutter data source adapter alive while the text view holds a weak reference.
         var gutterDataSourceAdapter: GutterLineViewDataSourceAdapter?
@@ -664,7 +672,15 @@ private struct TextViewRepresentable: NSViewRepresentable {
                 return
             }
 
-            selection = textView.selectedRange()
+            let newSelection = textView.selectedRange()
+            selectionGeneration += 1
+            let capturedGeneration = selectionGeneration
+            hasPendingSelectionUpdate = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.selectionGeneration == capturedGeneration else { return }
+                self.hasPendingSelectionUpdate = false
+                self.selection = newSelection
+            }
         }
 
     }
