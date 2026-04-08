@@ -499,7 +499,9 @@ private struct TextViewRepresentable: NSViewRepresentable {
         context.coordinator.isUserEditing = false
 
         if textView.textSelection != selection, let selection {
+            context.coordinator.isUpdating = true
             textView.textSelection = selection
+            context.coordinator.isUpdating = false
         }
 
         if textView.isEditable != isEnabled {
@@ -639,6 +641,9 @@ private struct TextViewRepresentable: NSViewRepresentable {
         var scrollOffsetChangeHandler: (@MainActor (CGFloat) -> Void)?
         /// Tracks the last restored scroll offset to avoid re-applying on every update.
         var lastRestoredScrollOffset: CGFloat?
+        /// Defers selection writes until the current AppKit update cycle finishes.
+        private var pendingSelection: NSRange?
+        private var hasScheduledSelectionFlush = false
 
         init(text: Binding<AttributedString>, selection: Binding<NSRange?>) {
             self._text = text
@@ -664,7 +669,25 @@ private struct TextViewRepresentable: NSViewRepresentable {
                 return
             }
 
-            selection = textView.selectedRange()
+            enqueueSelectionSync(textView.selectedRange())
+        }
+
+        private func enqueueSelectionSync(_ newSelection: NSRange) {
+            pendingSelection = newSelection
+
+            guard !hasScheduledSelectionFlush else { return }
+            hasScheduledSelectionFlush = true
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+
+                self.hasScheduledSelectionFlush = false
+                let selection = self.pendingSelection
+                self.pendingSelection = nil
+
+                guard self.selection != selection else { return }
+                self.selection = selection
+            }
         }
 
     }

@@ -5,6 +5,18 @@
     @MainActor
     class TypingAttributesTests: XCTestCase {
 
+        private func baselineOffset(in attributes: [NSAttributedString.Key: Any]) -> CGFloat? {
+            if let value = attributes[.baselineOffset] as? CGFloat {
+                return value
+            }
+
+            if let value = attributes[.baselineOffset] as? NSNumber {
+                return CGFloat(value.doubleValue)
+            }
+
+            return nil
+        }
+
         func testDefaultSetup() {
             let textView = STTextView()
             XCTAssertEqual(textView.typingAttributes.count, 3)
@@ -168,6 +180,111 @@
             // Typing attributes should use default font
             XCTAssertEqual(textView.typingAttributes[.font] as? NSFont, defaultFont,
                           "Setting plain text should not inherit attributes from previous attributed content")
+        }
+
+        func testLineGeometryAddAttributesPreservesParagraphStyleAndScrubsMetadata() {
+            let textView = STTextView()
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.alignment = .center
+            paragraphStyle.headIndent = 12
+
+            textView.attributedText = NSAttributedString(
+                string: "Test",
+                attributes: [.paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle]
+            )
+
+            let configuration = STLineGeometryConfiguration(rowHeight: 32, textBandHeight: 18, baselineOffset: 5)
+            textView.lineGeometryConfiguration = configuration
+            textView.addAttributes([.foregroundColor: NSColor.systemRed], range: NSRange(location: 0, length: 4))
+
+            let attributes = textView.attributedText!.attributes(at: 0, effectiveRange: nil)
+            let resolvedParagraphStyle = attributes[.paragraphStyle] as? NSParagraphStyle
+
+            XCTAssertEqual(resolvedParagraphStyle?.alignment, .center)
+            XCTAssertEqual(resolvedParagraphStyle?.headIndent, 12)
+            XCTAssertEqual(resolvedParagraphStyle?.minimumLineHeight, configuration.rowHeight)
+            XCTAssertEqual(resolvedParagraphStyle?.maximumLineHeight, configuration.rowHeight)
+            XCTAssertEqual(baselineOffset(in: attributes), configuration.baselineOffset)
+            XCTAssertNil(attributes[.stLineGeometryOriginalParagraphStyle])
+            XCTAssertNil(attributes[.stLineGeometryOriginalBaselineOffset])
+        }
+
+        func testLineGeometrySetAttributesKeepsNotebookGeometryVisible() {
+            let textView = STTextView()
+            textView.text = "Test"
+
+            let configuration = STLineGeometryConfiguration(rowHeight: 28, textBandHeight: 16, baselineOffset: 4)
+            textView.lineGeometryConfiguration = configuration
+            textView.setAttributes([.foregroundColor: NSColor.systemBlue], range: NSRange(location: 0, length: 4))
+
+            let attributes = textView.attributedText!.attributes(at: 0, effectiveRange: nil)
+            let paragraphStyle = attributes[.paragraphStyle] as? NSParagraphStyle
+
+            XCTAssertEqual(attributes[.foregroundColor] as? NSColor, NSColor.systemBlue)
+            XCTAssertEqual(paragraphStyle?.minimumLineHeight, configuration.rowHeight)
+            XCTAssertEqual(paragraphStyle?.maximumLineHeight, configuration.rowHeight)
+            XCTAssertEqual(baselineOffset(in: attributes), configuration.baselineOffset)
+        }
+
+        func testLineGeometryRemoveAttributeCannotRemoveVisibleGeometry() {
+            let textView = STTextView()
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.alignment = .right
+
+            textView.attributedText = NSAttributedString(
+                string: "Test",
+                attributes: [
+                    .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
+                    .baselineOffset: CGFloat(2)
+                ]
+            )
+
+            let configuration = STLineGeometryConfiguration(rowHeight: 30, textBandHeight: 18, baselineOffset: 6)
+            textView.lineGeometryConfiguration = configuration
+            textView.removeAttribute(.paragraphStyle, range: NSRange(location: 0, length: 4))
+            textView.removeAttribute(.baselineOffset, range: NSRange(location: 0, length: 4))
+
+            let activeAttributes = textView.attributedText!.attributes(at: 0, effectiveRange: nil)
+            let activeParagraphStyle = activeAttributes[.paragraphStyle] as? NSParagraphStyle
+
+            XCTAssertEqual(activeParagraphStyle?.minimumLineHeight, configuration.rowHeight)
+            XCTAssertEqual(activeParagraphStyle?.maximumLineHeight, configuration.rowHeight)
+            XCTAssertEqual(baselineOffset(in: activeAttributes), configuration.baselineOffset)
+
+            textView.lineGeometryConfiguration = nil
+
+            let restoredAttributes = textView.attributedText!.attributes(at: 0, effectiveRange: nil)
+            XCTAssertNil(restoredAttributes[.paragraphStyle])
+            XCTAssertNil(restoredAttributes[.baselineOffset])
+        }
+
+        func testDisablingLineGeometryRestoresOriginalParagraphStyleAndBaseline() {
+            let textView = STTextView()
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.alignment = .justified
+            paragraphStyle.headIndent = 8
+
+            textView.attributedText = NSAttributedString(
+                string: "Test",
+                attributes: [
+                    .paragraphStyle: paragraphStyle.copy() as! NSParagraphStyle,
+                    .baselineOffset: CGFloat(3)
+                ]
+            )
+
+            textView.lineGeometryConfiguration = STLineGeometryConfiguration(rowHeight: 34, textBandHeight: 20, baselineOffset: 7)
+            textView.lineGeometryConfiguration = nil
+
+            let attributes = textView.attributedText!.attributes(at: 0, effectiveRange: nil)
+            let restoredParagraphStyle = attributes[.paragraphStyle] as? NSParagraphStyle
+
+            XCTAssertEqual(restoredParagraphStyle?.alignment, .justified)
+            XCTAssertEqual(restoredParagraphStyle?.headIndent, 8)
+            XCTAssertEqual(restoredParagraphStyle?.minimumLineHeight, 0)
+            XCTAssertEqual(restoredParagraphStyle?.maximumLineHeight, 0)
+            XCTAssertEqual(baselineOffset(in: attributes), 3)
+            XCTAssertNil(attributes[.stLineGeometryOriginalParagraphStyle])
+            XCTAssertNil(attributes[.stLineGeometryOriginalBaselineOffset])
         }
     }
 #endif

@@ -7,6 +7,7 @@ import STTextKitPlus
 extension STTextView: NSTextViewportLayoutControllerDelegate {
 
     public func textViewportLayoutControllerWillLayout(_ textViewportLayoutController: NSTextViewportLayoutController) {
+        invalidateVisibleLineMetricsCache()
         lastUsedFragments = Set(fragmentViewMap.keyEnumerator().allObjects as! [NSTextLayoutFragment])
 
         if ProcessInfo().environment["ST_LAYOUT_DEBUG"] == "YES" {
@@ -98,6 +99,7 @@ extension STTextView: NSTextViewportLayoutControllerDelegate {
 
         updateSelectedRangeHighlight()
         updateSelectedLineHighlight()
+        cachedVisibleLineMetrics = buildVisibleLineMetrics()
         layoutGutter()
 
         if let viewportRange = textViewportLayoutController.viewportRange {

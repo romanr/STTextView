@@ -14,7 +14,7 @@ extension STTextView {
         }
 
         // TODO: loop over all selected ranges
-        guard let selectionsAttributedString = textLayoutManager.textSelectionsAttributedString(),
+                guard let selectionsAttributedString = textLayoutManager.textSelectionsAttributedString().map(lineGeometryPublicAttributedString(_:)),
               let textRange = currentSelectionRanges.first else {
             return
         }

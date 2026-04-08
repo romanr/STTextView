@@ -21,6 +21,13 @@ extension STTextView {
             for selectionTextRange in insertionPointsRanges {
                 textLayoutManager.enumerateTextSegments(in: selectionTextRange, type: .standard) { textSegmentRange, textSegmentFrame, _, _ in
                     if let textSegmentRange {
+                        if lineGeometryConfiguration != nil {
+                            if let preferredCaretFrame = preferredCaretRect(at: textSegmentRange.location) {
+                                textSelectionFrames.append(preferredCaretFrame)
+                            }
+                            return false
+                        }
+
                         let documentRange = textLayoutManager.documentRange
                         guard !documentRange.isEmpty else {
                             // empty document

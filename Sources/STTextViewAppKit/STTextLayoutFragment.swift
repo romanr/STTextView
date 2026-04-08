@@ -6,17 +6,108 @@ import STObjCLandShim
 
 final class STTextLayoutFragment: NSTextLayoutFragment {
     private let defaultParagraphStyle: NSParagraphStyle
+    private let lineGeometryConfiguration: STLineGeometryConfiguration?
     var showsInvisibleCharacters = false
 
-    init(textElement: NSTextElement, range rangeInElement: NSTextRange?, paragraphStyle: NSParagraphStyle) {
+    init(textElement: NSTextElement, range rangeInElement: NSTextRange?, paragraphStyle: NSParagraphStyle, lineGeometryConfiguration: STLineGeometryConfiguration?) {
         self.defaultParagraphStyle = paragraphStyle
+        self.lineGeometryConfiguration = lineGeometryConfiguration
         super.init(textElement: textElement, range: rangeInElement)
     }
 
     required init?(coder: NSCoder) {
         self.defaultParagraphStyle = NSParagraphStyle.default
+        self.lineGeometryConfiguration = nil
         self.showsInvisibleCharacters = false
         super.init(coder: coder)
+    }
+
+    func caretTextBandRect(for lineFragment: NSTextLineFragment, segmentFrame: CGRect) -> CGRect? {
+        guard let lineGeometryConfiguration else {
+            return nil
+        }
+
+        let rowMinY = min(
+            lineFragment.isExtraLineFragment ? extraLineMinY(for: lineFragment) : layoutFragmentFrame.minY + lineFragment.typographicBounds.minY,
+            segmentFrame.minY - lineGeometryConfiguration.baselineOffset
+        )
+
+        return CGRect(
+            x: segmentFrame.minX,
+            y: rowMinY + lineGeometryConfiguration.baselineOffset,
+            width: segmentFrame.width,
+            height: lineGeometryConfiguration.textBandHeight
+        )
+    }
+
+    func lineMetrics(for lineFragment: NSTextLineFragment, segmentFrame: CGRect) -> STLineMetrics? {
+        guard let lineGeometryConfiguration else {
+            return nil
+        }
+
+        let actualRowRect = CGRect(
+            x: layoutFragmentFrame.minX,
+            y: lineFragment.isExtraLineFragment ? extraLineMinY(for: lineFragment) : layoutFragmentFrame.minY + lineFragment.typographicBounds.minY,
+            width: layoutFragmentFrame.width,
+            height: lineHeight(for: lineFragment)
+        )
+        let textBandHeight = min(
+            max(segmentFrame.height, lineGeometryConfiguration.textBandHeight),
+            max(actualRowRect.height, lineGeometryConfiguration.textBandHeight)
+        )
+        let rowMinY = min(actualRowRect.minY, segmentFrame.minY - lineGeometryConfiguration.baselineOffset)
+        let rowHeight = max(
+            actualRowRect.maxY,
+            rowMinY + max(actualRowRect.height, textBandHeight + lineGeometryConfiguration.baselineOffset)
+        ) - rowMinY
+        let rowRect = CGRect(
+            x: actualRowRect.minX,
+            y: rowMinY,
+            width: actualRowRect.width,
+            height: rowHeight
+        )
+
+        return STLineMetrics(
+            lineIndex: 0,
+            rowRect: rowRect,
+            textBandRect: CGRect(
+                x: actualRowRect.minX,
+                y: rowRect.minY + lineGeometryConfiguration.baselineOffset,
+                width: actualRowRect.width,
+                height: textBandHeight
+            ),
+            baselineY: rowRect.minY + lineGeometryConfiguration.baselineOffset,
+            hasBackingParagraph: !lineFragment.isExtraLineFragment
+        )
+    }
+
+    func lineHeight(for lineFragment: NSTextLineFragment) -> CGFloat {
+        guard lineFragment.isExtraLineFragment else {
+            return lineFragment.typographicBounds.height
+        }
+
+        if textLineFragments.count >= 2 {
+            return textLineFragments[textLineFragments.count - 2].typographicBounds.height
+        }
+
+        if let lineGeometryConfiguration {
+            return lineGeometryConfiguration.rowHeight
+        }
+
+        return max(layoutFragmentFrame.height, defaultParagraphStyle.minimumLineHeight)
+    }
+
+    func extraLineMinY(for lineFragment: NSTextLineFragment) -> CGFloat {
+        guard lineFragment.isExtraLineFragment else {
+            return layoutFragmentFrame.minY + lineFragment.typographicBounds.minY
+        }
+
+        if textLineFragments.count >= 2 {
+            let previousLineFragment = textLineFragments[textLineFragments.count - 2]
+            return layoutFragmentFrame.minY + previousLineFragment.typographicBounds.maxY
+        }
+
+        return layoutFragmentFrame.minY
     }
 
     // Provide default line height based on the typingattributed. By default return (0, 0, 10, 14)

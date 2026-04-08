@@ -65,7 +65,7 @@ extension STTextView: NSServicesMenuRequestor {
             return false
         }
 
-        guard let attributedString = textLayoutManager.textSelectionsAttributedString()?.mutableCopy() as? NSMutableAttributedString else {
+        guard let attributedString = textLayoutManager.textSelectionsAttributedString().map(lineGeometryPublicAttributedString(_:)).flatMap({ $0.mutableCopy() as? NSMutableAttributedString }) else {
             return false
         }
 

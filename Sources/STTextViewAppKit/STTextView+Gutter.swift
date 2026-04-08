@@ -281,16 +281,25 @@ extension STTextView {
 
         // Empty document — show a single view for line 1
         if textLayoutManager.documentRange.isEmpty {
-            if let selectionFrame = textLayoutManager.textSegmentFrame(at: textLayoutManager.documentRange.location, type: .standard) {
-                let lineID = Self.gutterLineViewID(for: 1)
-                visibleIDs.insert(lineID)
+            let lineID = Self.gutterLineViewID(for: 1)
+            visibleIDs.insert(lineID)
 
-                let lineView = lineViewForID(lineID, in: container, dataSource: dataSource, lineNumber: 1, lineContent: "")
+            let lineView = lineViewForID(lineID, in: container, dataSource: dataSource, lineNumber: 1, lineContent: "")
+
+            if let metrics = visibleLineMetrics().first {
+                // Use canonical metrics (works for both notebook and legacy)
+                lineView.frame = CGRect(
+                    origin: CGPoint(x: 0, y: metrics.rowRect.minY),
+                    size: CGSize(width: customGutterWidth, height: metrics.rowRect.height)
+                ).pixelAligned
+            } else if let selectionFrame = textLayoutManager.textSegmentFrame(at: textLayoutManager.documentRange.location, type: .standard) {
+                // Fallback to raw selection frame
                 lineView.frame = CGRect(
                     origin: CGPoint(x: 0, y: selectionFrame.origin.y),
                     size: CGSize(width: customGutterWidth, height: typingLineHeight)
                 ).pixelAligned
             }
+
             pruneStaleLineViews(in: container, keeping: visibleIDs)
             addCustomGutterSeparator(to: container)
             return
@@ -318,6 +327,22 @@ extension STTextView {
         )
 
         let startLineIndex = textElementsBeforeViewport.count
+
+        // Build a line-index → metrics lookup for notebook mode gutter positioning.
+        // nil when not in notebook mode — signals the legacy path should be used.
+        let notebookMetricsMap: [Int: STLineMetrics]?
+        if lineGeometryConfiguration != nil {
+            let metrics = visibleLineMetrics()
+            var map = [Int: STLineMetrics]()
+            map.reserveCapacity(metrics.count)
+            for m in metrics {
+                map[m.lineIndex] = m
+            }
+            notebookMetricsMap = map
+        } else {
+            notebookMetricsMap = nil
+        }
+
         var linesCount = 0
 
         for (layoutFragment, fragmentView) in visibleFragmentViews {
@@ -341,43 +366,35 @@ extension STTextView {
 
                 let lineView = lineViewForID(lineID, in: container, dataSource: dataSource, lineNumber: lineNumber, lineContent: lineContent)
 
-                // Size the gutter line view to cover only the text-content area,
-                // excluding trailing lineSpacing. This ensures vertically-centered
-                // gutter labels align with the text baseline region instead of being
-                // pushed down by the lineSpacing gap below.
-                // For extra line fragments, typographicBounds.height may be invalid (FB15131180);
-                // fall back to the previous line fragment's height or typingLineHeight.
-                let lineHeight: CGFloat
-                let lineY: CGFloat
-                if textLineFragment.isExtraLineFragment {
-                    if layoutFragment.textLineFragments.count >= 2 {
-                        let prevLineFragment = layoutFragment.textLineFragments[layoutFragment.textLineFragments.count - 2]
-                        lineHeight = prevLineFragment.typographicBounds.height
-                    } else {
-                        lineHeight = typingLineHeight
-                    }
-                    lineY = fragmentView.frame.origin.y
+                let lineFrame: CGRect
+                if let metricsMap = notebookMetricsMap, let metrics = metricsMap[lineNumber - 1] {
+                    // Notebook mode: use canonical row geometry from STLineMetrics
+                    lineFrame = CGRect(
+                        origin: CGPoint(x: 0, y: metrics.rowRect.minY),
+                        size: CGSize(width: customGutterWidth, height: metrics.rowRect.height)
+                    )
                 } else {
-                    // Use typographicBounds.height directly as the label height.
-                    // TextKit 2 prepends lineSpacing to the NEXT paragraph's fragment
-                    // (not appending to the current one), so the first paragraph's fragment
-                    // has height = textHeight only, while subsequent paragraphs have height
-                    // = lineSpacing + textHeight. Subtracting lineSpacing would give ~0pt
-                    // for the first line. typographicBounds.height = maximumLineHeight =
-                    // the text content area, which is correct for all lines regardless of
-                    // their position in the document.
-                    lineHeight = textLineFragment.typographicBounds.height
-                    // Offset by typographicBounds.origin.y to position within the fragment.
-                    // For the first line of a paragraph: origin.y is 0 (no offset).
-                    // For subsequent lines in a wrapped paragraph: origin.y is the
-                    // accumulated height of preceding lines.
-                    lineY = fragmentView.frame.origin.y + textLineFragment.typographicBounds.origin.y
+                    // Legacy mode or fallback: use fragment-based positioning
+                    let lineHeight: CGFloat
+                    let lineY: CGFloat
+                    if textLineFragment.isExtraLineFragment {
+                        if layoutFragment.textLineFragments.count >= 2 {
+                            let prevLineFragment = layoutFragment.textLineFragments[layoutFragment.textLineFragments.count - 2]
+                            lineHeight = prevLineFragment.typographicBounds.height
+                        } else {
+                            lineHeight = typingLineHeight
+                        }
+                        lineY = fragmentView.frame.origin.y
+                    } else {
+                        lineHeight = textLineFragment.typographicBounds.height
+                        lineY = fragmentView.frame.origin.y + textLineFragment.typographicBounds.origin.y
+                    }
+                    lineFrame = CGRect(
+                        origin: CGPoint(x: 0, y: lineY),
+                        size: CGSize(width: customGutterWidth, height: lineHeight)
+                    )
                 }
-
-                lineView.frame = CGRect(
-                    origin: CGPoint(x: 0, y: lineY),
-                    size: CGSize(width: customGutterWidth, height: lineHeight)
-                ).pixelAligned
+                lineView.frame = lineFrame.pixelAligned
 
                 linesCount += 1
             }

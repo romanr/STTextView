@@ -25,6 +25,11 @@ import STTextKitPlus
 import STTextViewCommon
 import AVFoundation
 
+extension NSAttributedString.Key {
+    static let stLineGeometryOriginalParagraphStyle = NSAttributedString.Key("STLineGeometryOriginalParagraphStyle")
+    static let stLineGeometryOriginalBaselineOffset = NSAttributedString.Key("STLineGeometryOriginalBaselineOffset")
+}
+
 /// A TextKit2 text view without NSTextView baggage
 @objc
 open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
@@ -169,7 +174,9 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
     @objc
     public internal(set) var typingAttributes: [NSAttributedString.Key: Any] {
         get {
-            _typingAttributes.merging(_defaultTypingAttributes) { (current, _) in current }
+            resolvedLineGeometryAttributes(
+                for: _typingAttributes.merging(_defaultTypingAttributes) { (current, _) in current }
+            )
         }
 
         set {
@@ -239,7 +246,9 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
                let textContentManager = textElement.textContentManager {
                 let offset = textContentManager.offset(from: elementRange.location, to: startLocation)
                 assert(offset != NSNotFound, "Unexpected location")
-                typingAttrs = attributedTextElement.attributedString.attributes(at: offset + offsetDiff, effectiveRange: nil)
+                typingAttrs = lineGeometryContentAttributes(
+                    for: attributedTextElement.attributedString.attributes(at: offset + offsetDiff, effectiveRange: nil)
+                )
             }
 
             return false
@@ -247,6 +256,200 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
 
         // fill in with missing typing attributes if needed
         return typingAttrs.merging(_defaultTypingAttributes, uniquingKeysWith: { current, _ in current })
+    }
+
+    private func resolvedLineGeometryAttributes(for attributes: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
+        let contentAttributes = lineGeometryContentAttributes(for: attributes)
+
+        guard let lineGeometryConfiguration else {
+            return contentAttributes
+        }
+
+        var resolvedAttributes = contentAttributes
+        let baseParagraphStyle = (contentAttributes[.paragraphStyle] as? NSParagraphStyle)
+            ?? defaultParagraphStyle
+
+        resolvedAttributes[.paragraphStyle] = lineGeometryParagraphStyle(
+            for: lineGeometryConfiguration,
+            basedOn: baseParagraphStyle
+        )
+        resolvedAttributes[.baselineOffset] = lineGeometryConfiguration.baselineOffset
+
+        return resolvedAttributes
+    }
+
+    func lineGeometryContentAttributes(for attributes: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
+        var contentAttributes = lineGeometryPublicAttributes(for: attributes)
+
+        if let originalParagraphStyle = attributes[.stLineGeometryOriginalParagraphStyle] {
+            if originalParagraphStyle is NSNull {
+                contentAttributes.removeValue(forKey: .paragraphStyle)
+            } else {
+                contentAttributes[.paragraphStyle] = originalParagraphStyle
+            }
+        }
+
+        if let originalBaselineOffset = attributes[.stLineGeometryOriginalBaselineOffset] {
+            if originalBaselineOffset is NSNull {
+                contentAttributes.removeValue(forKey: .baselineOffset)
+            } else {
+                contentAttributes[.baselineOffset] = originalBaselineOffset
+            }
+        }
+
+        return contentAttributes
+    }
+
+    func lineGeometryPublicAttributes(for attributes: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
+        var publicAttributes = attributes
+        publicAttributes.removeValue(forKey: .stLineGeometryOriginalParagraphStyle)
+        publicAttributes.removeValue(forKey: .stLineGeometryOriginalBaselineOffset)
+        return publicAttributes
+    }
+
+    private func lineGeometryStorageAttributes(for attributes: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
+        let contentAttributes = lineGeometryContentAttributes(for: attributes)
+
+        guard lineGeometryConfiguration != nil else {
+            return contentAttributes
+        }
+
+        var storageAttributes = resolvedLineGeometryAttributes(for: contentAttributes)
+        storageAttributes[.stLineGeometryOriginalParagraphStyle] = contentAttributes[.paragraphStyle] ?? NSNull()
+        storageAttributes[.stLineGeometryOriginalBaselineOffset] = contentAttributes[.baselineOffset] ?? NSNull()
+        return storageAttributes
+    }
+
+    private func lineGeometryParagraphStyle(for lineGeometryConfiguration: STLineGeometryConfiguration, basedOn paragraphStyle: NSParagraphStyle) -> NSParagraphStyle {
+        let notebookParagraphStyle = (paragraphStyle.mutableCopy() as? NSMutableParagraphStyle) ?? NSMutableParagraphStyle()
+        notebookParagraphStyle.lineSpacing = 0
+        notebookParagraphStyle.minimumLineHeight = lineGeometryConfiguration.rowHeight
+        notebookParagraphStyle.maximumLineHeight = lineGeometryConfiguration.rowHeight
+        return notebookParagraphStyle.copy() as? NSParagraphStyle ?? notebookParagraphStyle
+    }
+
+    private func applyLineGeometryConfigurationToDocumentIfNeeded() {
+        guard let textContentStorage = textContentManager as? NSTextContentStorage,
+              let textStorage = textContentStorage.textStorage,
+              textStorage.length > 0
+        else {
+            return
+        }
+
+        let fullRange = NSRange(location: 0, length: textStorage.length)
+        var updates: [(range: NSRange, attributes: [NSAttributedString.Key: Any])] = []
+
+        textStorage.enumerateAttributes(in: fullRange, options: []) { attributes, range, _ in
+            let resolvedAttributes = if lineGeometryConfiguration != nil {
+                lineGeometryStorageAttributes(for: attributes)
+            } else {
+                lineGeometryContentAttributes(for: attributes)
+            }
+            if NSDictionary(dictionary: attributes).isEqual(to: resolvedAttributes) == false {
+                updates.append((range, resolvedAttributes))
+            }
+        }
+
+        guard !updates.isEmpty else {
+            return
+        }
+
+        textContentManager.performEditingTransaction {
+            textStorage.beginEditing()
+            for update in updates {
+                textStorage.setAttributes(update.attributes, range: update.range)
+            }
+            textStorage.endEditing()
+        }
+    }
+
+    func lineGeometryPublicAttributedString(_ attributedString: NSAttributedString) -> NSAttributedString {
+        transformedLineGeometryAttributedString(attributedString) { [self] attributes in
+            lineGeometryPublicAttributes(for: attributes)
+        }
+    }
+
+    private func lineGeometryStorageAttributedString(_ attributedString: NSAttributedString) -> NSAttributedString {
+        transformedLineGeometryAttributedString(attributedString) { [self] attributes in
+            lineGeometryStorageAttributes(for: attributes)
+        }
+    }
+
+    private func transformedLineGeometryAttributedString(
+        _ attributedString: NSAttributedString,
+        transform: ([NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any]
+    ) -> NSAttributedString {
+        guard attributedString.length > 0 else {
+            return attributedString
+        }
+
+        let transformedAttributedString = NSMutableAttributedString(attributedString: attributedString)
+        let fullRange = NSRange(location: 0, length: transformedAttributedString.length)
+
+        transformedAttributedString.beginEditing()
+        transformedAttributedString.enumerateAttributes(in: fullRange, options: []) { attributes, range, _ in
+            transformedAttributedString.setAttributes(transform(attributes), range: range)
+        }
+        transformedAttributedString.endEditing()
+
+        return transformedAttributedString
+    }
+
+    private func performTextStorageMutation(_ mutation: (NSTextStorage) -> Void) {
+        guard let textContentStorage = textContentManager as? NSTextContentStorage,
+              let textStorage = textContentStorage.textStorage else {
+            return
+        }
+
+        if textContentManager.hasEditingTransaction {
+            mutation(textStorage)
+        } else {
+            textContentManager.performEditingTransaction {
+                mutation(textStorage)
+            }
+        }
+    }
+
+    private func updateLayoutAfterAttributeMutation(_ updateLayout: Bool) {
+        if updateLayout, !textContentManager.hasEditingTransaction {
+            needsLayout = true
+        }
+    }
+
+    private func mutateLineGeometryContentAttributes(
+        in range: NSRange,
+        updateLayout: Bool,
+        mutation: (inout [NSAttributedString.Key: Any]) -> Void
+    ) {
+        guard range.length > 0 else {
+            return
+        }
+
+        performTextStorageMutation { textStorage in
+            var updates: [(range: NSRange, attributes: [NSAttributedString.Key: Any])] = []
+
+            textStorage.enumerateAttributes(in: range, options: []) { attributes, effectiveRange, _ in
+                var contentAttributes = lineGeometryContentAttributes(for: attributes)
+                mutation(&contentAttributes)
+
+                let storageAttributes = lineGeometryStorageAttributes(for: contentAttributes)
+                if NSDictionary(dictionary: attributes).isEqual(to: storageAttributes) == false {
+                    updates.append((effectiveRange, storageAttributes))
+                }
+            }
+
+            guard !updates.isEmpty else {
+                return
+            }
+
+            textStorage.beginEditing()
+            for update in updates {
+                textStorage.setAttributes(update.attributes, range: update.range)
+            }
+            textStorage.endEditing()
+        }
+
+        updateLayoutAfterAttributeMutation(updateLayout)
     }
 
     // line height based on current typing font and current typing paragraph
@@ -301,7 +504,11 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
             }
         }
         get {
-            textContentManager.attributedString(in: nil)
+            guard let attributedString = textContentManager.attributedString(in: nil) else {
+                return nil
+            }
+
+            return lineGeometryPublicAttributedString(attributedString)
         }
     }
 
@@ -482,6 +689,20 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
         }
     }
 
+    open var lineGeometryConfiguration: STLineGeometryConfiguration? {
+        didSet {
+            guard oldValue != lineGeometryConfiguration else {
+                return
+            }
+
+            applyLineGeometryConfigurationToDocumentIfNeeded()
+            updateTypingAttributes()
+            textLayoutManager.invalidateLayout(for: textLayoutManager.documentRange)
+            needsLayout = true
+            needsDisplay = true
+        }
+    }
+
     /// A Boolean value that indicates whether the receiver allows its background color to change.
     @objc
     open dynamic var allowsDocumentBackgroundColorChange = true
@@ -603,6 +824,8 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
     var fragmentViewMap: NSMapTable<NSTextLayoutFragment, STTextLayoutFragmentView>
     var lastUsedFragments: Set<NSTextLayoutFragment> = []
     private var _usageBoundsForTextContainerObserver: NSKeyValueObservation?
+    var cachedVisibleLineMetrics: [STLineMetrics]?
+    private weak var observedClipView: NSClipView?
 
     lazy var _speechSynthesizer = AVSpeechSynthesizer()
     private lazy var _defaultTextContainerSize: CGSize = NSTextContainer().size
@@ -677,7 +900,6 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
         }
     }
 
-    /// A Boolean value that indicates whether incremental searching is enabled.
     ///
     /// See `NSTextFinder` for information about the find bar.
     ///
@@ -887,6 +1109,445 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
         }
     }
 
+    func preferredCaretRect(at location: NSTextLocation) -> CGRect? {
+        guard let snapshot = resolvedEditorLocation(at: location) else {
+            return nil
+        }
+
+        guard let textBandRect = caretTextBandRect(for: snapshot) else {
+            return nil
+        }
+
+        return CGRect(
+            origin: CGPoint(x: snapshot.segmentFrame.minX, y: textBandRect.minY),
+            size: CGSize(width: snapshot.segmentFrame.width, height: textBandRect.height)
+        )
+    }
+
+    func preferredRowRect(at location: NSTextLocation) -> CGRect? {
+        guard let snapshot = resolvedEditorLocation(at: location) else {
+            return nil
+        }
+
+        if let metrics = lineMetrics(for: snapshot) {
+            return metrics.rowRect
+        }
+
+        return fallbackRowRect(for: snapshot)
+    }
+
+    open func visibleLineMetrics() -> [STLineMetrics] {
+        cachedVisibleLineMetrics ?? []
+    }
+
+    open func currentEditorContext() -> STEditorContextSnapshot? {
+        let location = textLayoutManager.textSelections.last?.textRanges.last?.endLocation
+            ?? textLayoutManager.documentRange.location
+
+        guard let snapshot = resolvedEditorLocation(at: location),
+              let geometry = editorContextGeometry(for: snapshot)
+        else {
+            return nil
+        }
+
+        let lineRangeUTF16 = NSRange(snapshot.lineTextRange, in: textContentManager)
+        let caretLocationUTF16 = textLayoutManager.offset(from: textLayoutManager.documentRange.location, to: location)
+        let localCaretLocationUTF16 = min(
+            max(textLayoutManager.offset(from: snapshot.lineTextRange.location, to: location), 0),
+            lineRangeUTF16.length
+        )
+        let lineNSString = snapshot.lineText as NSString
+        let lineSuffixRangeUTF16 = NSRange(location: caretLocationUTF16, length: lineRangeUTF16.length - localCaretLocationUTF16)
+        let lineSuffixText = lineNSString.substring(from: localCaretLocationUTF16)
+
+        let nonWordCharacterSet = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "_'"))
+            .inverted
+        let suffixSearchRange = NSRange(location: localCaretLocationUTF16, length: lineRangeUTF16.length - localCaretLocationUTF16)
+        let wordBoundaryRange = lineNSString.rangeOfCharacter(from: nonWordCharacterSet, options: [], range: suffixSearchRange)
+        let currentWordLength = if suffixSearchRange.length == 0 {
+            0
+        } else if wordBoundaryRange.location == NSNotFound {
+            suffixSearchRange.length
+        } else {
+            wordBoundaryRange.location - localCaretLocationUTF16
+        }
+
+        return STEditorContextSnapshot(
+            caretLocationUTF16: caretLocationUTF16,
+            lineIndex: snapshot.lineIndex,
+            lineRangeUTF16: lineRangeUTF16,
+            caretRectInEditor: geometry.caretRect,
+            rowRectInEditor: geometry.lineMetrics.rowRect,
+            currentWordAfterCaretRangeUTF16: NSRange(location: caretLocationUTF16, length: currentWordLength),
+            lineSuffixRangeUTF16: lineSuffixRangeUTF16,
+            lineSuffixText: lineSuffixText,
+            isAtLineStart: localCaretLocationUTF16 == 0,
+            isEmptyLine: lineRangeUTF16.length == 0,
+            hasBackingParagraph: snapshot.hasBackingParagraph
+        )
+    }
+
+    private func editorContextGeometry(for snapshot: ResolvedEditorLocation) -> EditorContextGeometry? {
+        if let cachedLineMetrics = cachedLineMetrics(for: snapshot) {
+            return EditorContextGeometry(
+                lineMetrics: cachedLineMetrics,
+                caretRect: editorContextCaretRect(for: snapshot, lineMetrics: cachedLineMetrics)
+            )
+        }
+
+        guard let computedLineMetrics = lineMetrics(for: snapshot) else {
+            return nil
+        }
+
+        return EditorContextGeometry(
+            lineMetrics: computedLineMetrics,
+            caretRect: editorContextCaretRect(for: snapshot, lineMetrics: computedLineMetrics)
+        )
+    }
+
+    private func cachedLineMetrics(for snapshot: ResolvedEditorLocation) -> STLineMetrics? {
+        let targetY = snapshot.segmentFrame.midY
+
+        return cachedVisibleLineMetrics?.first { metrics in
+            guard metrics.lineIndex == snapshot.lineIndex,
+                  metrics.hasBackingParagraph == snapshot.hasBackingParagraph
+            else {
+                return false
+            }
+
+            return targetY >= metrics.rowRect.minY - 0.5 && targetY <= metrics.rowRect.maxY + 0.5
+        }
+    }
+
+    private func editorContextCaretRect(for snapshot: ResolvedEditorLocation, lineMetrics: STLineMetrics) -> CGRect {
+        CGRect(
+            origin: CGPoint(x: snapshot.segmentFrame.minX, y: lineMetrics.textBandRect.minY),
+            size: CGSize(width: snapshot.segmentFrame.width, height: lineMetrics.textBandRect.height)
+        )
+    }
+
+    private func resolvedEditorLocation(at location: NSTextLocation) -> ResolvedEditorLocation? {
+        guard let segmentFrame = textLayoutManager.textSegmentFrame(at: location, type: .standard) else {
+            return nil
+        }
+
+        let documentRange = textLayoutManager.documentRange
+        if documentRange.isEmpty {
+            return ResolvedEditorLocation(
+                kind: .emptyDocument,
+                location: location,
+                segmentFrame: segmentFrame,
+                layoutFragment: nil,
+                lineFragment: nil,
+                lineIndex: 0,
+                lineTextRange: NSTextRange(location: location),
+                lineText: "",
+                hasBackingParagraph: false
+            )
+        }
+
+        if location == documentRange.endLocation,
+           let extraLayoutFragment = textLayoutManager.extraLineTextLayoutFragment() as? STTextLayoutFragment {
+            return ResolvedEditorLocation(
+                kind: .extraLineFragment,
+                location: location,
+                segmentFrame: segmentFrame,
+                layoutFragment: extraLayoutFragment,
+                lineFragment: resolvedExtraLineFragment(in: extraLayoutFragment),
+                lineIndex: textContentManager.textElements(
+                    for: NSTextRange(location: documentRange.location, end: location)!
+                ).count,
+                lineTextRange: NSTextRange(location: location),
+                lineText: "",
+                hasBackingParagraph: false
+            )
+        }
+
+        guard let layoutFragment = textLayoutManager.textLayoutFragment(for: location) as? STTextLayoutFragment else {
+            return nil
+        }
+
+        let lineTextRange = (layoutFragment.textElement as? NSTextParagraph)?.paragraphContentRange ?? layoutFragment.rangeInElement
+
+        return ResolvedEditorLocation(
+            kind: .regular,
+            location: location,
+            segmentFrame: segmentFrame,
+            layoutFragment: layoutFragment,
+            lineFragment: resolvedLineFragment(in: layoutFragment, at: location),
+            lineIndex: textContentManager.textElements(
+                for: NSTextRange(location: documentRange.location, end: lineTextRange.location)!
+            ).count,
+            lineTextRange: lineTextRange,
+            lineText: textContentManager.attributedString(in: lineTextRange)?.string ?? "",
+            hasBackingParagraph: true
+        )
+    }
+
+    private func lineMetrics(for snapshot: ResolvedEditorLocation) -> STLineMetrics? {
+        switch snapshot.kind {
+        case .emptyDocument:
+            let rowRect: CGRect
+            let textBandRect: CGRect
+
+            if let configuration = lineGeometryConfiguration {
+                let textBandHeight = max(snapshot.segmentFrame.height, configuration.textBandHeight)
+                let rowHeight = max(configuration.rowHeight, textBandHeight + configuration.baselineOffset)
+                rowRect = CGRect(
+                    x: 0,
+                    y: snapshot.segmentFrame.minY - configuration.baselineOffset,
+                    width: textContainer.size.width,
+                    height: rowHeight
+                )
+                textBandRect = CGRect(
+                    x: rowRect.minX,
+                    y: rowRect.minY + configuration.baselineOffset,
+                    width: rowRect.width,
+                    height: textBandHeight
+                )
+            } else {
+                rowRect = CGRect(
+                    x: 0,
+                    y: snapshot.segmentFrame.minY,
+                    width: textContainer.size.width,
+                    height: typingLineHeight
+                )
+                textBandRect = defaultTextBandRect(for: rowRect)
+            }
+
+            return STLineMetrics(
+                lineIndex: snapshot.lineIndex,
+                rowRect: rowRect,
+                textBandRect: textBandRect,
+                baselineY: emptyDocumentBaselineY(for: textBandRect),
+                hasBackingParagraph: snapshot.hasBackingParagraph
+            )
+        case .extraLineFragment, .regular:
+            guard let layoutFragment = snapshot.layoutFragment,
+                  let lineFragment = snapshot.lineFragment else {
+                return nil
+            }
+
+            let rowRect: CGRect
+            let textBandRect: CGRect
+
+            if let geometryLineMetrics = layoutFragment.lineMetrics(for: lineFragment, segmentFrame: snapshot.segmentFrame) {
+                rowRect = geometryLineMetrics.rowRect
+                textBandRect = geometryLineMetrics.textBandRect
+            } else {
+                guard let fallbackRowRect = fallbackRowRect(for: snapshot) else {
+                    return nil
+                }
+
+                rowRect = fallbackRowRect
+                textBandRect = defaultTextBandRect(for: rowRect)
+            }
+
+            return STLineMetrics(
+                lineIndex: snapshot.lineIndex,
+                rowRect: rowRect,
+                textBandRect: textBandRect,
+                baselineY: baselineY(for: layoutFragment, lineFragment: lineFragment),
+                hasBackingParagraph: snapshot.hasBackingParagraph
+            )
+        }
+    }
+
+    private func caretTextBandRect(for snapshot: ResolvedEditorLocation) -> CGRect? {
+        switch snapshot.kind {
+        case .emptyDocument:
+            guard let configuration = lineGeometryConfiguration else {
+                return nil
+            }
+
+            return CGRect(
+                x: snapshot.segmentFrame.minX,
+                y: snapshot.segmentFrame.minY,
+                width: snapshot.segmentFrame.width,
+                height: configuration.textBandHeight
+            )
+        case .extraLineFragment, .regular:
+            guard let layoutFragment = snapshot.layoutFragment,
+                  let lineFragment = snapshot.lineFragment else {
+                return nil
+            }
+
+            return layoutFragment.caretTextBandRect(for: lineFragment, segmentFrame: snapshot.segmentFrame)
+        }
+    }
+
+    private func fallbackRowRect(for snapshot: ResolvedEditorLocation) -> CGRect? {
+        switch snapshot.kind {
+        case .emptyDocument:
+            return CGRect(
+                x: 0,
+                y: snapshot.segmentFrame.minY,
+                width: editorLocalLineWidth(preferredWidth: textContainer.size.width),
+                height: typingLineHeight
+            )
+        case .extraLineFragment:
+            guard let layoutFragment = snapshot.layoutFragment,
+                  let lineFragment = snapshot.lineFragment else {
+                return nil
+            }
+
+            return CGRect(
+                x: layoutFragment.layoutFragmentFrame.minX,
+                y: layoutFragment.extraLineMinY(for: lineFragment),
+                width: editorLocalLineWidth(preferredWidth: layoutFragment.layoutFragmentFrame.width),
+                height: layoutFragment.lineHeight(for: lineFragment)
+            )
+        case .regular:
+            guard let layoutFragment = snapshot.layoutFragment,
+                  let lineFragment = snapshot.lineFragment else {
+                return nil
+            }
+
+            return CGRect(
+                x: layoutFragment.layoutFragmentFrame.minX,
+                y: layoutFragment.layoutFragmentFrame.minY + lineFragment.typographicBounds.minY,
+                width: editorLocalLineWidth(preferredWidth: layoutFragment.layoutFragmentFrame.width),
+                height: lineFragment.typographicBounds.height
+            )
+        }
+    }
+
+    private func resolvedLineFragment(in layoutFragment: NSTextLayoutFragment, at location: NSTextLocation) -> NSTextLineFragment? {
+        if let containingLineFragment = layoutFragment.textLineFragments.first(where: { lineFragment in
+            guard let textRange = lineFragment.textRange(in: layoutFragment) else {
+                return false
+            }
+
+            return textRange.contains(location)
+        }) {
+            return containingLineFragment
+        }
+
+        return layoutFragment.textLineFragments.first(where: { lineFragment in
+            guard let textRange = lineFragment.textRange(in: layoutFragment) else {
+                return false
+            }
+
+            return textRange.endLocation == location
+        }) ?? layoutFragment.textLineFragments.first
+    }
+
+    private func resolvedExtraLineFragment(in layoutFragment: NSTextLayoutFragment) -> NSTextLineFragment? {
+        layoutFragment.textLineFragments.last(where: \ .isExtraLineFragment) ?? layoutFragment.textLineFragments.last
+    }
+
+    private func baselineY(for layoutFragment: STTextLayoutFragment, lineFragment: NSTextLineFragment) -> CGFloat {
+        let fragmentViewFrame = fragmentViewMap.object(forKey: layoutFragment)?.frame
+        let metrics = STGutterCalculations.calculateLineNumberMetrics(
+            for: lineFragment,
+            in: layoutFragment,
+            fragmentViewFrame: fragmentViewFrame
+        )
+        return metrics.cellFrame.minY + metrics.locationForFirstCharacter.y + metrics.baselineYOffset
+    }
+
+    private func emptyDocumentBaselineY(for textBandRect: CGRect) -> CGFloat {
+        let paragraphStyle = typingAttributes[.paragraphStyle] as? NSParagraphStyle ?? defaultParagraphStyle
+        let baselineOffset = STGutterCalculations.calculateBaselineOffset(
+            lineHeight: typingLineHeight,
+            paragraphStyle: paragraphStyle
+        )
+        let font = typingAttributes[.font] as? NSFont ?? self.font
+        return textBandRect.minY + font.ascender - baselineOffset
+    }
+
+    private func defaultTextBandRect(for rowRect: CGRect) -> CGRect {
+        CGRect(x: rowRect.minX, y: rowRect.minY, width: editorLocalLineWidth(preferredWidth: rowRect.width), height: rowRect.height)
+    }
+
+    private func editorLocalLineWidth(preferredWidth: CGFloat) -> CGFloat {
+        if preferredWidth > 0.5 {
+            return preferredWidth
+        }
+
+        return max(textContainer.size.width, contentView.bounds.width, bounds.width)
+    }
+
+    func buildVisibleLineMetrics() -> [STLineMetrics] {
+        let documentRange = textLayoutManager.documentRange
+
+        if documentRange.isEmpty {
+            guard let snapshot = resolvedEditorLocation(at: documentRange.location),
+                  let metrics = lineMetrics(for: snapshot)
+            else {
+                return []
+            }
+
+            return [metrics]
+        }
+
+        guard let viewportRange = textLayoutManager.textViewportLayoutController.viewportRange else {
+            return []
+        }
+
+        let visibleFragmentViews = STGutterCalculations.visibleFragmentViewsInViewport(
+            fragmentViewMap: fragmentViewMap,
+            viewportRange: viewportRange
+        )
+
+        guard !visibleFragmentViews.isEmpty else {
+            return []
+        }
+
+        var visibleMetrics: [STLineMetrics] = []
+        for (layoutFragment, _) in visibleFragmentViews {
+            for lineFragment in layoutFragment.textLineFragments where (lineFragment.isExtraLineFragment || layoutFragment.textLineFragments.first == lineFragment) {
+                let location = if lineFragment.isExtraLineFragment {
+                    layoutFragment.rangeInElement.endLocation
+                } else {
+                    ((layoutFragment.textElement as? NSTextParagraph)?.paragraphContentRange ?? layoutFragment.rangeInElement).location
+                }
+
+                guard let snapshot = resolvedEditorLocation(at: location),
+                      let lineMetrics = lineMetrics(for: snapshot)
+                else {
+                    continue
+                }
+
+                visibleMetrics.append(lineMetrics)
+            }
+        }
+
+        return visibleMetrics
+    }
+
+    func invalidateVisibleLineMetricsCache() {
+        cachedVisibleLineMetrics = nil
+    }
+
+    @objc private func contentViewBoundsDidChange(_ notification: Notification) {
+        invalidateVisibleLineMetricsCache()
+    }
+
+    private struct ResolvedEditorLocation {
+        enum Kind {
+            case emptyDocument
+            case extraLineFragment
+            case regular
+        }
+
+        let kind: Kind
+        let location: NSTextLocation
+        let segmentFrame: CGRect
+        let layoutFragment: STTextLayoutFragment?
+        let lineFragment: NSTextLineFragment?
+        let lineIndex: Int
+        let lineTextRange: NSTextRange
+        let lineText: String
+        let hasBackingParagraph: Bool
+    }
+
+    private struct EditorContextGeometry {
+        let lineMetrics: STLineMetrics
+        let caretRect: CGRect
+    }
+
     override open func resetCursorRects() {
         super.resetCursorRects()
 
@@ -947,8 +1608,19 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
     override open func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
 
+        if let observedClipView {
+            NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: observedClipView)
+            self.observedClipView = nil
+        }
+
         if let scrollView {
+            NotificationCenter.default.removeObserver(self, name: NSScrollView.didLiveScrollNotification, object: scrollView)
             NotificationCenter.default.addObserver(self, selector: #selector(didLiveScrollNotification(_:)), name: NSScrollView.didLiveScrollNotification, object: scrollView)
+
+            let clipView = scrollView.contentView
+            clipView.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(self, selector: #selector(contentViewBoundsDidChange(_:)), name: NSView.boundsDidChangeNotification, object: clipView)
+            observedClipView = clipView
         }
     }
 
@@ -1146,31 +1818,23 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
 
     /// Add attribute.
     private func addAttributes(_ attrs: [NSAttributedString.Key: Any], range: NSRange, updateLayout: Bool) {
-        if let textContentStorage = textContentManager as? NSTextContentStorage,
-           let textStorage = textContentStorage.textStorage {
-            if textContentManager.hasEditingTransaction {
-                textStorage.addAttributes(attrs, range: range)
-            } else {
-                textContentManager.performEditingTransaction {
-                    textStorage.addAttributes(attrs, range: range)
-                }
+        if lineGeometryConfiguration != nil {
+            mutateLineGeometryContentAttributes(in: range, updateLayout: updateLayout) { contentAttributes in
+                contentAttributes.merge(attrs, uniquingKeysWith: { _, new in new })
             }
+            return
         }
 
-        if updateLayout, !textContentManager.hasEditingTransaction {
-            needsLayout = true
+        performTextStorageMutation { textStorage in
+            textStorage.addAttributes(attrs, range: range)
         }
+
+        updateLayoutAfterAttributeMutation(updateLayout)
     }
 
     /// Add attribute.
     func addAttributes(_ attrs: [NSAttributedString.Key: Any], range: NSTextRange, updateLayout: Bool = true) {
-        textContentManager.performEditingTransaction {
-            (textContentManager as? NSTextContentStorage)?.textStorage?.addAttributes(attrs, range: NSRange(range, in: textContentManager))
-        }
-
-        if updateLayout, !textContentManager.hasEditingTransaction {
-            needsLayout = true
-        }
+        addAttributes(attrs, range: NSRange(range, in: textContentManager), updateLayout: updateLayout)
     }
 
     /// Set attributes.
@@ -1188,14 +1852,14 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
 
     /// Set attributes.
     func setAttributes(_ attrs: [NSAttributedString.Key: Any], range: NSTextRange, updateLayout: Bool = true) {
+        let nsRange = NSRange(range, in: textContentManager)
 
-        textContentManager.performEditingTransaction {
-            (textContentManager as? NSTextContentStorage)?.textStorage?.setAttributes(attrs, range: NSRange(range, in: textContentManager))
+        performTextStorageMutation { textStorage in
+            let storageAttributes = lineGeometryStorageAttributes(for: attrs)
+            textStorage.setAttributes(storageAttributes, range: nsRange)
         }
 
-        if updateLayout, !textContentManager.hasEditingTransaction {
-            needsLayout = true
-        }
+        updateLayoutAfterAttributeMutation(updateLayout)
     }
 
     /// Remove rendering attribute.
@@ -1225,14 +1889,18 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
 
     /// Remove attributes.
     func removeAttribute(_ attribute: NSAttributedString.Key, range: NSTextRange, updateLayout: Bool = true) {
-
-        textContentManager.performEditingTransaction {
-            (textContentManager as? NSTextContentStorage)?.textStorage?.removeAttribute(attribute, range: NSRange(range, in: textContentManager))
+        if lineGeometryConfiguration != nil {
+            mutateLineGeometryContentAttributes(in: NSRange(range, in: textContentManager), updateLayout: updateLayout) { contentAttributes in
+                contentAttributes.removeValue(forKey: attribute)
+            }
+            return
         }
 
-        if updateLayout, !textContentManager.hasEditingTransaction {
-            needsLayout = true
+        performTextStorageMutation { textStorage in
+            textStorage.removeAttribute(attribute, range: NSRange(range, in: textContentManager))
         }
+
+        updateLayoutAfterAttributeMutation(updateLayout)
     }
 
     // Update selected line highlight layer
@@ -1251,95 +1919,27 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
             selectionView.addSubview(highlightView)
         }
 
-        if textLayoutManager.documentRange.isEmpty {
-            // - empty document has no layout fragments, nothing, it's empty and has to be handled explicitly.
-            // - there's no layout fragment at the document endLocation (technically it's out of bounds), has to be handled explicitly.
-            if let selectionFrame = textLayoutManager.textSegmentFrame(at: textLayoutManager.documentRange.location, type: .standard) {
-                layoutHighlightView(
-                    in: CGRect(
-                        origin: CGPoint(
-                            x: selectionView.bounds.minX,
-                            y: selectionFrame.origin.y
-                        ),
-                        size: CGSize(
-                            width: selectionView.bounds.width,
-                            height: typingLineHeight
-                        )
-                    ).pixelAligned
+        let combinedRowRect = textLayoutManager.insertionPointSelections
+            .flatMap(\.textRanges)
+            .filter(\.isEmpty)
+            .compactMap { preferredRowRect(at: $0.location) }
+            .reduce(nil as CGRect?) { partialResult, rowRect in
+                let selectionRect = CGRect(
+                    x: selectionView.bounds.minX,
+                    y: rowRect.minY,
+                    width: selectionView.bounds.width,
+                    height: rowRect.height
                 )
-            }
-        } else if let viewportRange = textLayoutManager.textViewportLayoutController.viewportRange {
-            // build the rectangle out of fragments rectangles
-            var combinedFragmentsRect: CGRect?
 
-            // TODO: some beutiful day:
-            // Don't rely on NSTextParagraph.paragraphContentRange, but that
-            // makes tricky to get all the conditions right (especially for last line)
-            // Problem is that NSTextParagraph.rangeInElement span across two lines (eg. "abc\n" are two lines) while
-            // paragraphContentRange is just one ("abc")
-            //
-            // Another idea here is to use `textLayoutManager.textLayoutFragment(for: selectionTextRange.location)`
-            // to find the layout fragment and us its frame as highlight area. It has its issue when it comes to the
-            // extra line fragment area (sic).
-            textLayoutManager.enumerateTextLayoutFragments(in: viewportRange) { layoutFragment in
-                let contentRangeInElement = (layoutFragment.textElement as? NSTextParagraph)?.paragraphContentRange ?? layoutFragment.rangeInElement
-                for textLineFragment in layoutFragment.textLineFragments {
-
-                    let isLineSelected = STGutterCalculations.isLineSelected(
-                        textLineFragment: textLineFragment,
-                        layoutFragment: layoutFragment,
-                        contentRangeInElement: contentRangeInElement,
-                        textLayoutManager: textLayoutManager
-                    )
-
-                    if isLineSelected {
-                        let lineSelectionRectangle: CGRect
-
-                        if !textLineFragment.isExtraLineFragment {
-                            var lineFragmentFrame = layoutFragment.layoutFragmentFrame
-                            lineFragmentFrame.size.height = textLineFragment.typographicBounds.height
-
-                            lineSelectionRectangle = CGRect(
-                                origin: CGPoint(
-                                    x: selectionView.bounds.minX,
-                                    y: lineFragmentFrame.origin.y + textLineFragment.typographicBounds.minY
-                                ),
-                                size: CGSize(
-                                    width: selectionView.bounds.width,
-                                    height: lineFragmentFrame.height
-                                )
-                            )
-                        } else {
-                            // Workaround for FB15131180
-                            let prevTextLineFragment = layoutFragment.textLineFragments[layoutFragment.textLineFragments.count - 2]
-                            var lineFragmentFrame = layoutFragment.layoutFragmentFrame
-                            lineFragmentFrame.size.height = prevTextLineFragment.typographicBounds.height
-
-                            lineSelectionRectangle = CGRect(
-                                origin: CGPoint(
-                                    x: selectionView.bounds.minX,
-                                    y: lineFragmentFrame.origin.y + prevTextLineFragment.typographicBounds.maxY
-                                ),
-                                size: CGSize(
-                                    width: selectionView.bounds.width,
-                                    height: lineFragmentFrame.height
-                                )
-                            )
-                        }
-
-                        if let rect = combinedFragmentsRect {
-                            combinedFragmentsRect = rect.union(lineSelectionRectangle)
-                        } else {
-                            combinedFragmentsRect = lineSelectionRectangle
-                        }
-                    }
+                if let partialResult {
+                    return partialResult.union(selectionRect)
                 }
-                return true
+
+                return selectionRect
             }
 
-            if let combinedFragmentsRect {
-                layoutHighlightView(in: combinedFragmentsRect.pixelAligned)
-            }
+        if let combinedRowRect {
+            layoutHighlightView(in: combinedRowRect.pixelAligned)
         }
     }
 
@@ -1385,6 +1985,7 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
     }
 
     @objc func didLiveScrollNotification(_ notification: Notification) {
+        invalidateVisibleLineMetricsCache()
         cancelComplete(notification.object)
     }
 
@@ -1621,6 +2222,21 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
             }
         }
 
+        // Notebook mode: ensure the document view fills at least the visible viewport
+        // so the ruled page extends to the bottom and virtual rows are clickable.
+        if lineGeometryConfiguration != nil, let scrollView {
+            let viewportHeight = scrollView.contentView.bounds.height
+            if estimatedSize.height < viewportHeight {
+                estimatedSize.height = viewportHeight
+            }
+        }
+
+        // Notebook mode: snap total height to a whole number of rows so ruled lines
+        // never end mid-row at the bottom of the scrollable area.
+        if let config = lineGeometryConfiguration, config.rowHeight > 0 {
+            estimatedSize.height = ceil(estimatedSize.height / config.rowHeight) * config.rowHeight
+        }
+
         let newFrame = backingAlignedRect(
             CGRect(origin: frame.origin, size: estimatedSize),
             options: .alignAllEdgesOutward
@@ -1690,6 +2306,7 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
     /// Invoked automatically at the end of a series of changes, this method posts an `textDidChangeNotification` to the default notification center, which also results in the delegate receiving `textViewDidChangeText(_:)` message.
     /// Subclasses implementing methods that change their text should invoke this method at the end of those methods.
     open func didChangeText() {
+        invalidateVisibleLineMetricsCache()
 
         let notification = Notification(name: STTextView.textDidChangeNotification, object: self, userInfo: nil)
         NotificationCenter.default.post(notification)
@@ -1738,19 +2355,20 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
     }
 
     func replaceCharacters(in textRange: NSTextRange, with replacementString: NSAttributedString, allowsTypingCoalescing: Bool) {
+        let resolvedReplacementString = lineGeometryStorageAttributedString(replacementString)
         let previousStringInRange = (textContentManager as? NSTextContentStorage)!.attributedString!.attributedSubstring(from: NSRange(textRange, in: textContentManager))
 
         textWillChange(self)
-        delegateProxy.textView(self, willChangeTextIn: textRange, replacementString: replacementString.string)
+        delegateProxy.textView(self, willChangeTextIn: textRange, replacementString: resolvedReplacementString.string)
 
         textContentManager.performEditingTransaction {
             textContentManager.replaceContents(
                 in: textRange,
-                with: [NSTextParagraph(attributedString: replacementString)]
+                with: [NSTextParagraph(attributedString: resolvedReplacementString)]
             )
         }
 
-        delegateProxy.textView(self, didChangeTextIn: textRange, replacementString: replacementString.string)
+        delegateProxy.textView(self, didChangeTextIn: textRange, replacementString: resolvedReplacementString.string)
         didChangeText(in: textRange)
 
         guard allowsUndo, let undoManager, undoManager.isUndoRegistrationEnabled else { return }
@@ -1759,7 +2377,7 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
         // A range that is as long as replacement string, so when undo it undo
         let undoRange = NSTextRange(
             location: textRange.location,
-            end: textContentManager.location(textRange.location, offsetBy: replacementString.length)
+            end: textContentManager.location(textRange.location, offsetBy: resolvedReplacementString.length)
         ) ?? textRange
 
         if let coalescingUndoManager = undoManager as? CoalescingUndoManager, !undoManager.isUndoing, !undoManager.isRedoing {
