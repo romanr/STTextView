@@ -1,6 +1,6 @@
 import AppKit
 
-public struct STEditorContextSnapshot {
+public struct STEditorContextSnapshot: Equatable, Sendable {
     public let caretLocationUTF16: Int
     public let lineIndex: Int
     public let lineRangeUTF16: NSRange
