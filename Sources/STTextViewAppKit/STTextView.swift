@@ -1302,7 +1302,7 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
                 )
                 textBandRect = CGRect(
                     x: rowRect.minX,
-                    y: rowRect.minY + configuration.baselineOffset,
+                    y: rowRect.maxY - textBandHeight - configuration.baselineOffset,
                     width: rowRect.width,
                     height: textBandHeight
                 )

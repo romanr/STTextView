@@ -27,14 +27,13 @@ final class STTextLayoutFragment: NSTextLayoutFragment {
             return nil
         }
 
-        let rowMinY = min(
-            lineFragment.isExtraLineFragment ? extraLineMinY(for: lineFragment) : layoutFragmentFrame.minY + lineFragment.typographicBounds.minY,
-            segmentFrame.minY - lineGeometryConfiguration.baselineOffset
-        )
+        let rowMinY: CGFloat = lineFragment.isExtraLineFragment
+            ? extraLineMinY(for: lineFragment)
+            : layoutFragmentFrame.minY + lineFragment.typographicBounds.minY
 
         return CGRect(
             x: segmentFrame.minX,
-            y: rowMinY + lineGeometryConfiguration.baselineOffset,
+            y: rowMinY + lineGeometryConfiguration.rowHeight - lineGeometryConfiguration.textBandHeight - lineGeometryConfiguration.baselineOffset,
             width: segmentFrame.width,
             height: lineGeometryConfiguration.textBandHeight
         )
@@ -45,38 +44,35 @@ final class STTextLayoutFragment: NSTextLayoutFragment {
             return nil
         }
 
-        let actualRowRect = CGRect(
-            x: layoutFragmentFrame.minX,
-            y: lineFragment.isExtraLineFragment ? extraLineMinY(for: lineFragment) : layoutFragmentFrame.minY + lineFragment.typographicBounds.minY,
-            width: layoutFragmentFrame.width,
-            height: lineHeight(for: lineFragment)
-        )
-        let textBandHeight = min(
-            max(segmentFrame.height, lineGeometryConfiguration.textBandHeight),
-            max(actualRowRect.height, lineGeometryConfiguration.textBandHeight)
-        )
-        let rowMinY = min(actualRowRect.minY, segmentFrame.minY - lineGeometryConfiguration.baselineOffset)
-        let rowHeight = max(
-            actualRowRect.maxY,
-            rowMinY + max(actualRowRect.height, textBandHeight + lineGeometryConfiguration.baselineOffset)
-        ) - rowMinY
+        // With the notebook paragraph style (lineSpacing = 0,
+        // minimumLineHeight = maximumLineHeight = rowHeight) the line fragment IS
+        // the row. Derive geometry directly from layoutFragmentFrame and the
+        // configuration rather than reconstructing it via segmentFrame /
+        // typographicBounds hedging, which over-compensates when baselineOffset
+        // approaches textBandHeight and produces mis-shifted, over-tall rows.
+        let rowMinY: CGFloat = lineFragment.isExtraLineFragment
+            ? extraLineMinY(for: lineFragment)
+            : layoutFragmentFrame.minY + lineFragment.typographicBounds.minY
+
         let rowRect = CGRect(
-            x: actualRowRect.minX,
+            x: layoutFragmentFrame.minX,
             y: rowMinY,
-            width: actualRowRect.width,
-            height: rowHeight
+            width: layoutFragmentFrame.width,
+            height: lineGeometryConfiguration.rowHeight
+        )
+
+        let textBandRect = CGRect(
+            x: rowRect.minX,
+            y: rowRect.maxY - lineGeometryConfiguration.textBandHeight - lineGeometryConfiguration.baselineOffset,
+            width: rowRect.width,
+            height: lineGeometryConfiguration.textBandHeight
         )
 
         return STLineMetrics(
             lineIndex: 0,
             rowRect: rowRect,
-            textBandRect: CGRect(
-                x: actualRowRect.minX,
-                y: rowRect.minY + lineGeometryConfiguration.baselineOffset,
-                width: actualRowRect.width,
-                height: textBandHeight
-            ),
-            baselineY: rowRect.minY + lineGeometryConfiguration.baselineOffset,
+            textBandRect: textBandRect,
+            baselineY: rowRect.maxY - lineGeometryConfiguration.textBandHeight - lineGeometryConfiguration.baselineOffset,
             hasBackingParagraph: !lineFragment.isExtraLineFragment
         )
     }
