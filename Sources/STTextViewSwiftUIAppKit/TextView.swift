@@ -92,10 +92,10 @@ public struct TextViewWithGutter<GutterContent: View>: SwiftUI.View, TextViewMod
     private let plugins: [any STPlugin]
     private let textViewType: STTextView.Type
     private let gutterWidth: CGFloat
-    private let gutterLineViewFactory: (Int, String) -> NSView
+    private let gutterLineViewFactory: (Int, String, Bool) -> NSView
     /// Returns only the AnyView for the given line, used to update an existing NSHostingView
     /// in-place (cheaper than allocating a new hosting view for every layout pass).
-    private let gutterViewUpdater: (Int, String) -> AnyView
+    private let gutterViewUpdater: (Int, String, Bool) -> AnyView
     /// Opaque identity value for the current gutter data.
     /// When this changes between SwiftUI updates, the gutter line views are reloaded
     /// so they pick up the new data. When it is unchanged (e.g. normal keystroke that
@@ -133,11 +133,45 @@ public struct TextViewWithGutter<GutterContent: View>: SwiftUI.View, TextViewMod
         self.textViewType = textViewType
         self.gutterWidth = gutterWidth
         self.gutterDataID = gutterDataID
-        self.gutterLineViewFactory = { lineNumber, lineContent in
+        self.gutterLineViewFactory = { lineNumber, lineContent, _ in
             NSHostingView(rootView: AnyView(gutterContent(lineNumber, lineContent)))
         }
-        self.gutterViewUpdater = { lineNumber, lineContent in
+        self.gutterViewUpdater = { lineNumber, lineContent, _ in
             AnyView(gutterContent(lineNumber, lineContent))
+        }
+    }
+
+    /// Create a text editor with a custom per-line gutter, including a flag for
+    /// wrapped continuation rows.
+    ///
+    /// The `gutterContent` builder is called once per visual row with
+    /// `(lineNumber, lineContent, isContinuation)`. For paragraphs that wrap to
+    /// multiple visual rows, the first row gets `isContinuation=false`, and every
+    /// subsequent wrapped row gets `isContinuation=true`. Use this to hide
+    /// paragraph-level badges on continuation rows while still rendering
+    /// per-row accents.
+    public init(
+        text: Binding<AttributedString>,
+        selection: Binding<NSRange?> = .constant(nil),
+        options: Options = [],
+        plugins: [any STPlugin] = [],
+        textViewType: STTextView.Type = STTextView.self,
+        gutterWidth: CGFloat,
+        gutterDataID: AnyHashable? = nil,
+        @ViewBuilder gutterContent: @escaping (_ lineNumber: Int, _ lineContent: String, _ isContinuation: Bool) -> GutterContent
+    ) {
+        _text = text
+        _selection = selection
+        self.options = options
+        self.plugins = plugins
+        self.textViewType = textViewType
+        self.gutterWidth = gutterWidth
+        self.gutterDataID = gutterDataID
+        self.gutterLineViewFactory = { lineNumber, lineContent, isContinuation in
+            NSHostingView(rootView: AnyView(gutterContent(lineNumber, lineContent, isContinuation)))
+        }
+        self.gutterViewUpdater = { lineNumber, lineContent, isContinuation in
+            AnyView(gutterContent(lineNumber, lineContent, isContinuation))
         }
     }
 
@@ -315,17 +349,21 @@ public extension TextViewModifier {
 /// destroying and recreating all visible NSHostingViews on every layout pass.
 private class GutterLineViewDataSourceAdapter: STGutterLineViewDataSource {
     /// Returns a new NSHostingView wrapping the gutter content for the given line.
-    var factory: (Int, String) -> NSView
+    var factory: (Int, String, Bool) -> NSView
     /// Returns the AnyView for the given line, used to update an existing hosting view in-place.
-    var viewUpdater: ((Int, String) -> AnyView)?
+    var viewUpdater: ((Int, String, Bool) -> AnyView)?
 
-    init(factory: @escaping (Int, String) -> NSView, viewUpdater: ((Int, String) -> AnyView)? = nil) {
+    init(factory: @escaping (Int, String, Bool) -> NSView, viewUpdater: ((Int, String, Bool) -> AnyView)? = nil) {
         self.factory = factory
         self.viewUpdater = viewUpdater
     }
 
     func textView(_ textView: STTextView, viewForGutterLine lineNumber: Int, content: String) -> NSView {
-        factory(lineNumber, content)
+        factory(lineNumber, content, false)
+    }
+
+    func textView(_ textView: STTextView, viewForGutterLine lineNumber: Int, content: String, isContinuation: Bool) -> NSView {
+        factory(lineNumber, content, isContinuation)
     }
 
     func textView(_ textView: STTextView, updateView existingView: NSView, forGutterLine lineNumber: Int, content: String) -> Bool {
@@ -336,7 +374,16 @@ private class GutterLineViewDataSourceAdapter: STGutterLineViewDataSource {
         }
         // Assign the new AnyView directly to the existing hosting view.
         // This is a lightweight SwiftUI reconciliation, not an NSView allocation.
-        hostingView.rootView = updater(lineNumber, content)
+        hostingView.rootView = updater(lineNumber, content, false)
+        return true
+    }
+
+    func textView(_ textView: STTextView, updateView existingView: NSView, forGutterLine lineNumber: Int, content: String, isContinuation: Bool) -> Bool {
+        guard let updater = viewUpdater,
+              let hostingView = existingView as? NSHostingView<AnyView> else {
+            return false
+        }
+        hostingView.rootView = updater(lineNumber, content, isContinuation)
         return true
     }
 }
@@ -371,16 +418,16 @@ private struct TextViewRepresentable: NSViewRepresentable {
     let gutterWidth: CGFloat
     /// Opaque identity for the current gutter data — see `TextViewWithGutter.gutterDataID`.
     let gutterDataID: AnyHashable?
-    let gutterLineViewFactory: ((Int, String) -> NSView)?
+    let gutterLineViewFactory: ((Int, String, Bool) -> NSView)?
     /// Returns only the AnyView for the given line, used to update existing NSHostingViews
     /// in-place without allocating a new hosting view (avoids the stutter on layout passes).
-    let gutterViewUpdater: ((Int, String) -> AnyView)?
+    let gutterViewUpdater: ((Int, String, Bool) -> AnyView)?
     let gutterBackgroundColor: NSColor?
     let gutterSeparatorColor: NSColor?
     let gutterSeparatorWidth: CGFloat
     let gutterShadow: NSShadow?
 
-    init(text: Binding<AttributedString>, selection: Binding<NSRange?>, options: TextView.Options, plugins: [any STPlugin] = [], textViewType: STTextView.Type = STTextView.self, gutterWidth: CGFloat = 0, gutterDataID: AnyHashable? = nil, gutterLineViewFactory: ((Int, String) -> NSView)? = nil, gutterViewUpdater: ((Int, String) -> AnyView)? = nil, gutterBackgroundColor: NSColor? = nil, gutterSeparatorColor: NSColor? = nil, gutterSeparatorWidth: CGFloat = 0, gutterShadow: NSShadow? = nil) {
+    init(text: Binding<AttributedString>, selection: Binding<NSRange?>, options: TextView.Options, plugins: [any STPlugin] = [], textViewType: STTextView.Type = STTextView.self, gutterWidth: CGFloat = 0, gutterDataID: AnyHashable? = nil, gutterLineViewFactory: ((Int, String, Bool) -> NSView)? = nil, gutterViewUpdater: ((Int, String, Bool) -> AnyView)? = nil, gutterBackgroundColor: NSColor? = nil, gutterSeparatorColor: NSColor? = nil, gutterSeparatorWidth: CGFloat = 0, gutterShadow: NSShadow? = nil) {
         self._text = text
         self._selection = selection
         self.options = options

@@ -825,6 +825,7 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
     var lastUsedFragments: Set<NSTextLayoutFragment> = []
     private var _usageBoundsForTextContainerObserver: NSKeyValueObservation?
     var cachedVisibleLineMetrics: [STLineMetrics]?
+    var cachedVisibleVisualLineMetrics: [STLineMetrics]?
     private weak var observedClipView: NSClipView?
 
     lazy var _speechSynthesizer = AVSpeechSynthesizer()
@@ -1140,6 +1141,22 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
         cachedVisibleLineMetrics ?? []
     }
 
+    /// Per-visual-line metrics for everything visible in the current viewport.
+    /// Unlike ``visibleLineMetrics()`` (which emits one entry per paragraph / extra line fragment),
+    /// this emits one entry for every visual row — including wrapped continuation rows.
+    /// Continuation rows share the paragraph's ``STLineMetrics/lineIndex`` and have
+    /// ``STLineMetrics/isContinuation`` set to `true`.
+    open func visibleVisualLineMetrics() -> [STLineMetrics] {
+        cachedVisibleVisualLineMetrics ?? []
+    }
+
+    /// The view that hosts the text fragments. Plugins that need to draw
+    /// line-bound overlays in the same coordinate space as the text should
+    /// attach their views as subviews of this view.
+    open var textContentView: NSView {
+        contentView
+    }
+
     open func currentEditorContext() -> STEditorContextSnapshot? {
         let location = textLayoutManager.textSelections.last?.textRanges.last?.endLocation
             ?? textLayoutManager.documentRange.location
@@ -1179,6 +1196,7 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
             lineRangeUTF16: lineRangeUTF16,
             caretRectInEditor: geometry.caretRect,
             rowRectInEditor: geometry.lineMetrics.rowRect,
+            textBandRectInEditor: geometry.lineMetrics.textBandRect,
             currentWordAfterCaretRangeUTF16: NSRange(location: caretLocationUTF16, length: currentWordLength),
             lineSuffixRangeUTF16: lineSuffixRangeUTF16,
             lineSuffixText: lineSuffixText,
@@ -1469,6 +1487,125 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
         return max(textContainer.size.width, contentView.bounds.width, bounds.width)
     }
 
+    /// Build one ``STLineMetrics`` per visual row (including wrapped continuations)
+    /// for everything currently in the viewport.
+    ///
+    /// Unlike ``buildVisibleLineMetrics()`` which emits one entry per paragraph /
+    /// extra line fragment, this enumerates **every** `NSTextLineFragment` owned
+    /// by each visible layout fragment. Continuation rows reuse the paragraph's
+    /// `lineIndex` and have `isContinuation=true`.
+    func buildVisibleVisualLineMetrics() -> [STLineMetrics] {
+        let documentRange = textLayoutManager.documentRange
+
+        if documentRange.isEmpty {
+            guard let snapshot = resolvedEditorLocation(at: documentRange.location),
+                  let metrics = lineMetrics(for: snapshot)
+            else {
+                return []
+            }
+
+            return [metrics]
+        }
+
+        guard let viewportRange = textLayoutManager.textViewportLayoutController.viewportRange else {
+            return []
+        }
+
+        let visibleFragmentViews = STGutterCalculations.visibleFragmentViewsInViewport(
+            fragmentViewMap: fragmentViewMap,
+            viewportRange: viewportRange
+        )
+
+        guard !visibleFragmentViews.isEmpty else {
+            return []
+        }
+
+        // Count paragraphs before the viewport to determine starting line index.
+        let textElementsBeforeViewport = textContentManager.textElements(
+            for: NSTextRange(
+                location: textLayoutManager.documentRange.location,
+                end: viewportRange.location
+            )!
+        )
+
+        var visibleMetrics: [STLineMetrics] = []
+        // paragraphIndex tracks the 0-based index of the paragraph we're iterating
+        // inside. Advanced once per visited layoutFragment (which always backs
+        // exactly one paragraph).
+        var paragraphIndex = textElementsBeforeViewport.count
+
+        for (layoutFragmentAny, _) in visibleFragmentViews {
+            // All layout fragments we allocate are STTextLayoutFragment; cast
+            // to access the notebook-aware geometry helpers.
+            let stLayoutFragment = layoutFragmentAny as? STTextLayoutFragment
+            let layoutFragment: NSTextLayoutFragment = layoutFragmentAny
+
+            let firstFragment = layoutFragment.textLineFragments.first
+            for lineFragment in layoutFragment.textLineFragments {
+                let isFirstFragment = (lineFragment === firstFragment)
+                let isExtra = lineFragment.isExtraLineFragment
+                // Continuation = not the first fragment AND not an extra line fragment.
+                let isContinuation = !isFirstFragment && !isExtra
+
+                // Extra line fragment = the invisible trailing empty line at doc
+                // end. It logically represents the *next* paragraph after this
+                // layoutFragment's backing paragraph.
+                let lineIndex = isExtra ? paragraphIndex + 1 : paragraphIndex
+
+                let metrics: STLineMetrics
+                if let stFragment = stLayoutFragment,
+                   let geometryMetrics = stFragment.lineMetrics(for: lineFragment, segmentFrame: .zero) {
+                    metrics = STLineMetrics(
+                        lineIndex: lineIndex,
+                        rowRect: geometryMetrics.rowRect,
+                        textBandRect: geometryMetrics.textBandRect,
+                        baselineY: geometryMetrics.baselineY,
+                        hasBackingParagraph: !isExtra,
+                        isContinuation: isContinuation
+                    )
+                } else {
+                    // Legacy mode (no lineGeometryConfiguration): derive from
+                    // typographicBounds so graphics align with actual text rows.
+                    let rowMinY: CGFloat
+                    let rowHeight: CGFloat
+                    if isExtra {
+                        if let stFragment = stLayoutFragment {
+                            rowMinY = stFragment.extraLineMinY(for: lineFragment)
+                            rowHeight = stFragment.lineHeight(for: lineFragment)
+                        } else {
+                            rowMinY = layoutFragment.layoutFragmentFrame.minY
+                            rowHeight = lineFragment.typographicBounds.height
+                        }
+                    } else {
+                        rowMinY = layoutFragment.layoutFragmentFrame.minY + lineFragment.typographicBounds.minY
+                        rowHeight = lineFragment.typographicBounds.height
+                    }
+                    let rowRect = CGRect(
+                        x: layoutFragment.layoutFragmentFrame.minX,
+                        y: rowMinY,
+                        width: layoutFragment.layoutFragmentFrame.width,
+                        height: rowHeight
+                    )
+                    metrics = STLineMetrics(
+                        lineIndex: lineIndex,
+                        rowRect: rowRect,
+                        textBandRect: rowRect,
+                        baselineY: rowRect.maxY,
+                        hasBackingParagraph: !isExtra,
+                        isContinuation: isContinuation
+                    )
+                }
+
+                visibleMetrics.append(metrics)
+            }
+
+            // Advance past the paragraph backing this layoutFragment.
+            paragraphIndex += 1
+        }
+
+        return visibleMetrics
+    }
+
     func buildVisibleLineMetrics() -> [STLineMetrics] {
         let documentRange = textLayoutManager.documentRange
 
@@ -1519,6 +1656,7 @@ open class STTextView: NSView, NSTextInput, NSTextContent, STTextViewProtocol {
 
     func invalidateVisibleLineMetricsCache() {
         cachedVisibleLineMetrics = nil
+        cachedVisibleVisualLineMetrics = nil
     }
 
     @objc private func contentViewBoundsDidChange(_ notification: Notification) {

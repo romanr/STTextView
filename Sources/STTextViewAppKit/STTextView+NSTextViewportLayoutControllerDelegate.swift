@@ -100,6 +100,7 @@ extension STTextView: NSTextViewportLayoutControllerDelegate {
         updateSelectedRangeHighlight()
         updateSelectedLineHighlight()
         cachedVisibleLineMetrics = buildVisibleLineMetrics()
+        cachedVisibleVisualLineMetrics = buildVisibleVisualLineMetrics()
         layoutGutter()
 
         if let viewportRange = textViewportLayoutController.viewportRange {

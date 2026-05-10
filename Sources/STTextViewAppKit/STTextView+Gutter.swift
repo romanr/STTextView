@@ -233,8 +233,13 @@ extension STTextView {
 
     // MARK: - Custom Gutter Line Views
 
-    /// Identifier prefix for custom gutter line views.
+    /// Identifier prefix for custom gutter line views (paragraph-first rows).
     private static let gutterLineViewIDPrefix = "stgutter-line-"
+
+    /// Identifier prefix for custom gutter continuation-row line views.
+    /// Continuation rows get their own identifier so they are distinct from
+    /// the paragraph's first-row view even when sharing its line number.
+    private static let gutterContinuationViewIDPrefix = "stgutter-cont-"
 
     /// Identifier for the trailing separator view inside the custom gutter container.
     private static let gutterSeparatorID = NSUserInterfaceItemIdentifier("stgutter-separator")
@@ -328,63 +333,101 @@ extension STTextView {
 
         let startLineIndex = textElementsBeforeViewport.count
 
-        // Build a line-index → metrics lookup for notebook mode gutter positioning.
-        // nil when not in notebook mode — signals the legacy path should be used.
-        let notebookMetricsMap: [Int: STLineMetrics]?
-        if lineGeometryConfiguration != nil {
-            let metrics = visibleLineMetrics()
-            var map = [Int: STLineMetrics]()
-            map.reserveCapacity(metrics.count)
-            for m in metrics {
-                map[m.lineIndex] = m
+        // In notebook mode, we have canonical per-visual-line metrics to drive
+        // gutter row Y/height. In legacy mode we fall back to fragment-derived
+        // positioning computed inline below.
+        let isNotebookMode = (lineGeometryConfiguration != nil)
+
+        var paragraphIndex = startLineIndex
+
+        for (layoutFragmentAny, fragmentView) in visibleFragmentViews {
+            let stLayoutFragment = layoutFragmentAny as? STTextLayoutFragment
+            let layoutFragment: NSTextLayoutFragment = layoutFragmentAny
+            // Extract the paragraph text content once, trimming the trailing newline.
+            // Used for both the paragraph's first row and its wrapped continuations.
+            let paragraphLineContent: String
+            if let paragraph = layoutFragment.textElement as? NSTextParagraph {
+                var text = paragraph.attributedString.string
+                if text.hasSuffix("\n") {
+                    text = String(text.dropLast())
+                }
+                paragraphLineContent = text
+            } else {
+                paragraphLineContent = ""
             }
-            notebookMetricsMap = map
-        } else {
-            notebookMetricsMap = nil
-        }
 
-        var linesCount = 0
+            let firstFragment = layoutFragment.textLineFragments.first
+            var continuationCounter = 0
 
-        for (layoutFragment, fragmentView) in visibleFragmentViews {
-            // One custom view per paragraph (first text line fragment or extra line fragment)
-            for textLineFragment in layoutFragment.textLineFragments where (textLineFragment.isExtraLineFragment || layoutFragment.textLineFragments.first == textLineFragment) {
-                let lineNumber = startLineIndex + linesCount + 1
-                let lineID = Self.gutterLineViewID(for: lineNumber)
-                visibleIDs.insert(lineID)
+            // Emit one gutter view per visual row: the paragraph's first fragment,
+            // every subsequent wrapped line fragment (continuation), and any
+            // extra-line-fragment at document end.
+            for textLineFragment in layoutFragment.textLineFragments {
+                let isFirstFragment = (textLineFragment === firstFragment)
+                let isExtra = textLineFragment.isExtraLineFragment
+                let isContinuation = !isFirstFragment && !isExtra
 
-                // Extract the paragraph text content, trimming the trailing newline
-                let lineContent: String
-                if let paragraph = layoutFragment.textElement as? NSTextParagraph {
-                    var text = paragraph.attributedString.string
-                    if text.hasSuffix("\n") {
-                        text = String(text.dropLast())
-                    }
-                    lineContent = text
+                // Line number:
+                // - first fragment of a paragraph => paragraphIndex + 1
+                // - continuation => same paragraph's number
+                // - extra line fragment => next paragraph (empty trailing line)
+                let lineNumber: Int
+                if isExtra {
+                    lineNumber = paragraphIndex + 2
                 } else {
-                    lineContent = ""
+                    lineNumber = paragraphIndex + 1
                 }
 
-                let lineView = lineViewForID(lineID, in: container, dataSource: dataSource, lineNumber: lineNumber, lineContent: lineContent)
+                let lineID: NSUserInterfaceItemIdentifier
+                if isContinuation {
+                    lineID = Self.gutterContinuationViewID(for: lineNumber, index: continuationCounter)
+                    continuationCounter += 1
+                } else {
+                    lineID = Self.gutterLineViewID(for: lineNumber)
+                }
+                visibleIDs.insert(lineID)
+
+                // Continuation rows have no backing text of their own in the
+                // data-source sense — pass the paragraph content so consumers
+                // can still reference it, but isContinuation lets them hide
+                // paragraph-level badges.
+                let rowContent = isExtra ? "" : paragraphLineContent
+
+                let lineView = lineViewForID(
+                    lineID,
+                    in: container,
+                    dataSource: dataSource,
+                    lineNumber: lineNumber,
+                    lineContent: rowContent,
+                    isContinuation: isContinuation
+                )
 
                 let lineFrame: CGRect
-                if let metricsMap = notebookMetricsMap, let metrics = metricsMap[lineNumber - 1] {
-                    // Notebook mode: use canonical row geometry from STLineMetrics
+                if isNotebookMode,
+                   let stFragment = stLayoutFragment,
+                   let geometryMetrics = stFragment.lineMetrics(for: textLineFragment, segmentFrame: .zero) {
+                    // Notebook mode: canonical row geometry — rowHeight-tall row
+                    // positioned at the same Y as the glyph band for this fragment.
                     lineFrame = CGRect(
-                        origin: CGPoint(x: 0, y: metrics.rowRect.minY),
-                        size: CGSize(width: customGutterWidth, height: metrics.rowRect.height)
+                        origin: CGPoint(x: 0, y: geometryMetrics.rowRect.minY),
+                        size: CGSize(width: customGutterWidth, height: geometryMetrics.rowRect.height)
                     )
                 } else {
-                    // Legacy mode or fallback: use fragment-based positioning
+                    // Legacy mode: fragment-derived positioning
                     let lineHeight: CGFloat
                     let lineY: CGFloat
-                    if textLineFragment.isExtraLineFragment {
+                    if isExtra {
                         if layoutFragment.textLineFragments.count >= 2 {
                             let prevLineFragment = layoutFragment.textLineFragments[layoutFragment.textLineFragments.count - 2]
                             lineHeight = prevLineFragment.typographicBounds.height
                         } else {
                             lineHeight = typingLineHeight
                         }
-                        lineY = fragmentView.frame.origin.y
+                        if let stFragment = stLayoutFragment {
+                            lineY = fragmentView.frame.origin.y + stFragment.extraLineMinY(for: textLineFragment) - layoutFragment.layoutFragmentFrame.minY
+                        } else {
+                            lineY = fragmentView.frame.origin.y
+                        }
                     } else {
                         lineHeight = textLineFragment.typographicBounds.height
                         lineY = fragmentView.frame.origin.y + textLineFragment.typographicBounds.origin.y
@@ -395,9 +438,10 @@ extension STTextView {
                     )
                 }
                 lineView.frame = lineFrame.pixelAligned
-
-                linesCount += 1
             }
+
+            // Advance past this layoutFragment's backing paragraph.
+            paragraphIndex += 1
         }
 
         // Remove views for lines that scrolled out of the viewport
@@ -437,6 +481,11 @@ extension STTextView {
         NSUserInterfaceItemIdentifier(gutterLineViewIDPrefix + "\(lineNumber)")
     }
 
+    /// Creates an identifier for a continuation-row gutter view (wrapped visual row).
+    private static func gutterContinuationViewID(for lineNumber: Int, index: Int) -> NSUserInterfaceItemIdentifier {
+        NSUserInterfaceItemIdentifier(gutterContinuationViewIDPrefix + "\(lineNumber)-\(index)")
+    }
+
     /// Returns (or creates) a gutter line view for the given identifier.
     ///
     /// When an existing view is found for the line, the data source is given a chance to
@@ -449,11 +498,12 @@ extension STTextView {
         in container: NSView,
         dataSource: any STGutterLineViewDataSource,
         lineNumber: Int,
-        lineContent: String
+        lineContent: String,
+        isContinuation: Bool = false
     ) -> NSView {
         // Attempt in-place update to avoid destroying and re-creating the NSHostingView.
         if let existing = container.subviews.first(where: { $0.identifier == id }) {
-            if dataSource.textView(self, updateView: existing, forGutterLine: lineNumber, content: lineContent) {
+            if dataSource.textView(self, updateView: existing, forGutterLine: lineNumber, content: lineContent, isContinuation: isContinuation) {
                 // Successfully updated — reuse the existing view as-is.
                 return existing
             }
@@ -461,7 +511,7 @@ extension STTextView {
             existing.removeFromSuperviewWithoutNeedingDisplay()
         }
 
-        let lineView = dataSource.textView(self, viewForGutterLine: lineNumber, content: lineContent)
+        let lineView = dataSource.textView(self, viewForGutterLine: lineNumber, content: lineContent, isContinuation: isContinuation)
         lineView.identifier = id
 
         // Allow content (e.g. breakpoint badges) to extend beyond the
@@ -481,6 +531,7 @@ extension STTextView {
         for subview in container.subviews where subview.identifier != nil {
             guard let id = subview.identifier else { continue }
             let isLineView = id.rawValue.hasPrefix(Self.gutterLineViewIDPrefix)
+                || id.rawValue.hasPrefix(Self.gutterContinuationViewIDPrefix)
             if isLineView && !visibleIDs.contains(id) {
                 subview.removeFromSuperviewWithoutNeedingDisplay()
             }

@@ -153,6 +153,34 @@ final class STTextLayoutFragment: NSTextLayoutFragment {
 
             let offset = -(lineFragment.typographicBounds.height * (paragraphStyle.stLineHeightMultiple - 1.0) / 2)
             lineFragment.draw(at: point.moved(dx: lineFragment.typographicBounds.origin.x, dy: lineFragment.typographicBounds.origin.y + offset), in: context)
+
+            // Monolithic row: separator drawn in the SAME context, same draw call
+            // as the glyph. No separate NSView, no separate cache, no separate
+            // invalidation. Whatever happens to the text fragment also happens to
+            // this stroke — they cannot desync.
+            //
+            // Width: span the text container, not `layoutFragmentFrame.width`.
+            // A short line's fragment box is only as wide as the glyph run; the
+            // container width is the editor area. Falling back to fragment width
+            // only if the container width is unbounded (non-wrapping layout).
+            if let lineGeometryConfiguration, lineGeometryConfiguration.drawsRowSeparator {
+                let rowLocalMinY: CGFloat = lineFragment.isExtraLineFragment
+                    ? extraLineMinY(for: lineFragment) - layoutFragmentFrame.minY
+                    : lineFragment.typographicBounds.minY
+                let rowLocalMaxY = rowLocalMinY + lineGeometryConfiguration.rowHeight
+                let separatorY = point.y + rowLocalMaxY.rounded(.down) - 0.25
+
+                let containerWidth = textLayoutManager?.textContainer?.size.width ?? .infinity
+                let rowWidth = containerWidth.isFinite ? containerWidth : layoutFragmentFrame.width
+
+                context.saveGState()
+                context.setStrokeColor(NSColor.separatorColor.cgColor)
+                context.setLineWidth(0.5)
+                context.move(to: CGPoint(x: point.x, y: separatorY))
+                context.addLine(to: CGPoint(x: point.x + rowWidth, y: separatorY))
+                context.strokePath()
+                context.restoreGState()
+            }
         }
 
         #if USE_FONT_SMOOTHING_STYLE
